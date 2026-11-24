@@ -203,6 +203,7 @@ Set these via `npx wrangler secret put SECRET_NAME`:
 | Secret | Required | Default | Description |
 |--------|----------|---------|-------------|
 | `FIGMA_ACCESS_TOKEN` | Yes | - | Your Figma API token |
+| `FIGMA_API_BASE_URL` | No | `https://api.figma.com/v1` | REST API base URL, including the version path; use a trusted endpoint because it receives access tokens |
 | `LOG_LEVEL` | No | `info` | Logging verbosity (trace/debug/info/warn/error/fatal) |
 | `BROWSER_TIMEOUT` | No | `120000` | Browser operation timeout (ms) |
 | `MAX_CONSOLE_LOGS` | No | `1000` | Max console logs to buffer |

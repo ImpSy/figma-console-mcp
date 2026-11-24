@@ -15,6 +15,29 @@ import {
 	FigmaAPI,
 } from "../src/core/figma-api";
 
+describe("FigmaAPI base URL", () => {
+	const realFetch = global.fetch;
+
+	afterEach(() => {
+		global.fetch = realFetch;
+	});
+
+	it.each([
+		[undefined, "https://api.figma.com/v1/files/abc/components"],
+		["https://proxy.example.com/figma/v1/", "https://proxy.example.com/figma/v1/files/abc/components"],
+	])("uses the configured API base URL %s", async (baseUrl, expectedUrl) => {
+		const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+			new Response(JSON.stringify({ meta: { components: [] } }), { status: 200 }),
+		);
+		global.fetch = fetchMock;
+		const api = new FigmaAPI({ accessToken: "figd_test", baseUrl });
+		await api.getComponents("abc");
+		expect(fetchMock).toHaveBeenCalledWith(expectedUrl, expect.objectContaining({
+			headers: expect.objectContaining({ "X-Figma-Token": "figd_test" }),
+		}));
+	});
+});
+
 // ============================================================================
 // extractFileKey
 // ============================================================================

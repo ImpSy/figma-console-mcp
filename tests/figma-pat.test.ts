@@ -4,6 +4,19 @@ const reply = (status: number, body: unknown = {}) =>
 	(async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch;
 
 describe("validateFigmaPAT", () => {
+	it.each([
+		[undefined, "https://api.figma.com/v1/me"],
+		["https://proxy.example.com/figma/v1/", "https://proxy.example.com/figma/v1/me"],
+	])("uses the configured API base URL %s", async (baseUrl, expectedUrl) => {
+		const fetchImpl = jest.fn<typeof fetch>().mockResolvedValue(
+			new Response(JSON.stringify({ id: "1", handle: "user", email: "" }), { status: 200 }),
+		);
+		await validateFigmaPAT("figd_test", fetchImpl, baseUrl);
+		expect(fetchImpl).toHaveBeenCalledWith(expectedUrl, {
+			headers: { "X-Figma-Token": "figd_test" },
+		});
+	});
+
 	it("returns the user for a token Figma accepts", async () => {
 		const user = { id: "1", handle: "tj", email: "x@y.z" };
 		expect(await validateFigmaPAT("figd_ok", reply(200, user))).toEqual(user);
@@ -83,6 +96,12 @@ describe("FigmaAPI 403 messages", () => {
 		respond403(JSON.stringify({ status: 403, err: "Forbidden" }));
 		const api = new FigmaAPI({ accessToken: "figd_test" });
 		await expect(api.getLocalVariables("abc")).rejects.toThrow(/file_variables:read scope, which Figma only grants on Enterprise plans/);
+	});
+
+	it("provides scope guidance with a prefixed custom API base", async () => {
+		respond403(JSON.stringify({ status: 403, err: "Forbidden" }));
+		const api = new FigmaAPI({ accessToken: "figd_test", baseUrl: "https://proxy.example.com/figma/v1" });
+		await expect(api.getComponents("abc")).rejects.toThrow(/library_content:read scope/);
 	});
 
 	it("leaves token failures to the expired/invalid guidance", async () => {

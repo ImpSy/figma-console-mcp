@@ -4,16 +4,16 @@
  */
 
 import { createChildLogger } from './logger.js';
+import { getFigmaApiBaseUrl } from './figma-api-base.js';
 
 const logger = createChildLogger({ component: 'figma-api' });
-
-const FIGMA_API_BASE = 'https://api.figma.com/v1';
 
 /**
  * Figma API Client Configuration
  */
 export interface FigmaAPIConfig {
   accessToken: string;
+  baseUrl?: string;
 }
 
 /**
@@ -154,16 +154,18 @@ export function requiredScopeFor(method: string, url: string): string | null {
 
 export class FigmaAPI {
   private accessToken: string;
+  private baseUrl: string;
 
   constructor(config: FigmaAPIConfig) {
     this.accessToken = config.accessToken;
+    this.baseUrl = getFigmaApiBaseUrl(config.baseUrl);
   }
 
   /**
    * Make authenticated request to Figma API
    */
   private async request(endpoint: string, options: RequestInit = {}): Promise<any> {
-    const url = `${FIGMA_API_BASE}${endpoint}`;
+    const url = `${this.baseUrl}${endpoint}`;
 
     // Detect token type and use appropriate authentication header
     // OAuth tokens start with 'figu_' and require Authorization: Bearer header
@@ -238,7 +240,7 @@ export class FigmaAPI {
           ' — Your Figma access token is expired or invalid. Generate a new personal access token at figma.com → Settings → Security → Personal access tokens, then update FIGMA_ACCESS_TOKEN in your MCP config. If Figma Desktop is open with the Desktop Bridge plugin running, most tools work without any REST token.';
       } else if (response.status === 403) {
         const method = (options.method || 'GET').toUpperCase();
-        const scope = requiredScopeFor(method, url);
+        const scope = requiredScopeFor(method, `${getFigmaApiBaseUrl()}${endpoint}`);
         if (scope) {
           const path = new URL(url).pathname;
           message += scope.startsWith('file_variables')

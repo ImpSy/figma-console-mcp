@@ -210,14 +210,14 @@ export class FigmaConsoleMCPv3 extends McpAgent {
 		const env = this.env as unknown as Env;
 		const propsToken = (this.props as { figmaAccessToken?: string } | undefined)?.figmaAccessToken;
 		if (propsToken) {
-			return new FigmaAPI({ accessToken: propsToken });
+			return new FigmaAPI({ accessToken: propsToken, baseUrl: env?.FIGMA_API_BASE_URL });
 		}
 
 		if (env?.FIGMA_ACCESS_TOKEN) {
 			logger.warn(
 				"FIGMA_ACCESS_TOKEN fallback is deprecated. User should authenticate via OAuth for proper per-user authentication."
 			);
-			return new FigmaAPI({ accessToken: env.FIGMA_ACCESS_TOKEN });
+			return new FigmaAPI({ accessToken: env.FIGMA_ACCESS_TOKEN, baseUrl: env.FIGMA_API_BASE_URL });
 		}
 
 		throw new Error(
@@ -1075,7 +1075,7 @@ export default {
 			// Validate them directly against Figma's API instead.
 			if (isFigmaPAT(bearerToken)) {
 				logger.info({ pathname: url.pathname }, "SSE request with Figma PAT — validating against Figma API");
-				const patUser = await validateFigmaPAT(bearerToken);
+				const patUser = await validateFigmaPAT(bearerToken, fetch, env.FIGMA_API_BASE_URL);
 				if (!patUser) {
 					logger.warn({ pathname: url.pathname }, "SSE request with invalid Figma PAT");
 					const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource`;
@@ -1180,7 +1180,7 @@ export default {
 			// and aren't stored in KV — validate directly against Figma's API.
 			if (isFigmaPAT(bearerToken)) {
 				logger.info({ pathname: url.pathname }, "MCP request with Figma PAT — validating against Figma API");
-				const patUser = await validateFigmaPAT(bearerToken);
+				const patUser = await validateFigmaPAT(bearerToken, fetch, env.FIGMA_API_BASE_URL);
 				if (!patUser) {
 					logger.warn({ pathname: url.pathname }, "MCP request with invalid Figma PAT");
 					const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource`;
@@ -1252,7 +1252,7 @@ export default {
 			// The Bearer token IS the Figma access token, so we use it directly
 			// FigmaAPI handles PAT vs OAuth header selection internally
 			const figmaAccessToken = bearerToken;
-			const statelessApi = new FigmaAPI({ accessToken: figmaAccessToken });
+			const statelessApi = new FigmaAPI({ accessToken: figmaAccessToken, baseUrl: env.FIGMA_API_BASE_URL });
 
 			const transport = new WebStandardStreamableHTTPServerTransport({
 				sessionIdGenerator: undefined, // Stateless — no session persistence needed

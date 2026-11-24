@@ -394,6 +394,11 @@ When you first use design system tools:
 2. Generate token with scopes (all Read unless noted): **File content**, **File versions**, **Library content**, **Library assets**, **Comments** (Read and write), **Current user**, and **Variables** (Enterprise only, optional)
 3. Add to MCP config as `FIGMA_ACCESS_TOKEN` environment variable
 
+To use a custom REST API endpoint, set `FIGMA_API_BASE_URL` in the MCP config's
+`env` section (for example, `https://proxy.example.com/v1`). It defaults to
+`https://api.figma.com/v1`; include the API version path. Only use a trusted
+endpoint, as it receives your Figma access token.
+
 ---
 
 ## 🛠️ Available Tools

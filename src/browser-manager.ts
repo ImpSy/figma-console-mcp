@@ -30,6 +30,7 @@ export interface Env {
 	OAUTH_TOKENS: KVNamespace; // KV for OAuth tokens (accessible across Durable Objects)
 	OAUTH_STATE: KVNamespace; // KV for OAuth state CSRF tokens (short-lived, 10 minute TTL)
 	FIGMA_ACCESS_TOKEN?: string; // Optional Figma API token for data extraction (deprecated, use OAuth)
+	FIGMA_API_BASE_URL?: string; // Optional Figma REST API base URL
 	FIGMA_OAUTH_CLIENT_ID?: string; // OAuth client ID for user authentication
 	FIGMA_OAUTH_CLIENT_SECRET?: string; // OAuth client secret for token exchange
 	CANONICAL_ORIGIN?: string; // Canonical origin for OAuth redirect URIs (e.g., https://figma-console-mcp.southleft.com)

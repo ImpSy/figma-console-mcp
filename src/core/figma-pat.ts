@@ -2,6 +2,8 @@
  * Figma Personal Access Token (PAT) checks for the Cloud endpoints.
  */
 
+import { getFigmaApiBaseUrl } from "./figma-api-base.js";
+
 export interface FigmaPatUser {
 	id: string;
 	handle: string;
@@ -30,9 +32,10 @@ export function isFigmaPAT(token: string): boolean {
 export async function validateFigmaPAT(
 	token: string,
 	fetchImpl: typeof fetch = fetch,
+	baseUrl?: string,
 ): Promise<FigmaPatUser | null> {
 	try {
-		const response = await fetchImpl("https://api.figma.com/v1/me", {
+		const response = await fetchImpl(`${getFigmaApiBaseUrl(baseUrl)}/me`, {
 			headers: { "X-Figma-Token": token },
 		});
 		if (response.status === 403) {
