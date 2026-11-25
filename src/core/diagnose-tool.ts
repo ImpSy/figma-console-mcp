@@ -23,6 +23,8 @@ export interface DiagnoseToolOptions {
 	getBundledPluginVersion?: () => string;
 	/** "local" for NPX/stdio mode, "cloud" for Cloudflare Workers mode */
 	mode: "local" | "cloud";
+	/** True when the local Desktop Bridge was turned off with FIGMA_DESKTOP_BRIDGE=false */
+	isDesktopBridgeDisabled?: () => boolean;
 	/** Snapshot of plugin connection state (or null if no WS server) */
 	getPluginState?: () => {
 		connected: boolean;
@@ -52,7 +54,10 @@ function buildReport(opts: DiagnoseToolOptions): string {
 
 	const plugin = opts.getPluginState?.();
 	lines.push("## Plugin connection");
-	if (!plugin) {
+	if (opts.mode === "local" && opts.isDesktopBridgeDisabled?.()) {
+		lines.push("- Desktop Bridge disabled (FIGMA_DESKTOP_BRIDGE=false): no WebSocket server is running, so plugin-based tools are unavailable. REST API tools still work with a token.");
+		lines.push("- To use the plugin: remove FIGMA_DESKTOP_BRIDGE from your MCP client config and restart the server.");
+	} else if (!plugin) {
 		if (opts.mode === "cloud") {
 			lines.push("- Desktop Bridge plugin not paired with this cloud session. Read tools that use the Figma REST API work; write tools need pairing.");
 			lines.push("- To pair: call `figma_pair_plugin`, then enter the code in the plugin's Cloud Mode section in Figma Desktop.");

@@ -441,6 +441,9 @@ For local development or custom deployments:
 # Log level (trace, debug, info, warn, error, fatal)
 LOG_LEVEL=info
 
+# Run without Figma Desktop: no WebSocket bridge, REST API tools only (enabled when unset)
+FIGMA_DESKTOP_BRIDGE=false
+
 # WebSocket bridge port range (defaults to 9223)
 FIGMA_WS_PORT=9223
 

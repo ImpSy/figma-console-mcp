@@ -49,6 +49,11 @@ import type { IFigmaConnector } from "./core/figma-connector.js";
 import { FigmaWebSocketServer, getBundledPluginVersion, getServerVersion } from "./core/websocket-server.js";
 import { WebSocketConnector } from "./core/websocket-connector.js";
 import {
+	DESKTOP_BRIDGE_DISABLED_MESSAGE,
+	DESKTOP_BRIDGE_ENV,
+	isDesktopBridgeEnabled,
+} from "./core/desktop-bridge-config.js";
+import {
 	DEFAULT_WS_PORT,
 	getPortRange,
 	advertisePort,
@@ -126,6 +131,8 @@ class LocalFigmaConsoleMCP {
 	private server: McpServer;
 	private figmaAPI: FigmaAPI | null = null;
 	private wsServer: FigmaWebSocketServer | null = null;
+	/** False when FIGMA_DESKTOP_BRIDGE=false: no WebSocket server, REST tools only (set in start()) */
+	private desktopBridgeEnabled = true;
 	private wsStartupError: { code: string; port: number } | null = null;
 	/** The port the WebSocket server actually bound to (may differ from preferred if fallback occurred) */
 	private wsActualPort: number | null = null;
@@ -292,6 +299,11 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 	 * Returns the active WebSocket Desktop Bridge connector.
 	 */
 	private async getDesktopConnector(): Promise<IFigmaConnector> {
+		if (!this.desktopBridgeEnabled) {
+			const err = new Error(DESKTOP_BRIDGE_DISABLED_MESSAGE);
+			(err as any).connectionError = this.buildConnectionError(err);
+			throw err;
+		}
 		if (this.wsServer?.isClientConnected()) {
 			try {
 				const wsConnector = new WebSocketConnector(this.wsServer);
@@ -356,6 +368,18 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 		const wsServerRunning = this.wsServer?.isStarted() ?? false;
 		const isTimeout = errorMsg.includes('timed out');
 		const isNoClient = errorMsg.includes('No active file') || errorMsg.includes('No WebSocket client');
+
+		if (!this.desktopBridgeEnabled) {
+			return {
+				layer: 1,
+				type: 'BRIDGE_DISABLED',
+				canRetry: false,
+				recoverySteps: [
+					"Use the REST API tools instead (they need FIGMA_ACCESS_TOKEN)",
+					`To use the Desktop Bridge, remove ${DESKTOP_BRIDGE_ENV} from the MCP config and restart the server`,
+				],
+			};
+		}
 
 		if (!wsServerRunning) {
 			return {
@@ -1252,7 +1276,10 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 					if (probe) {
 						const probeStart = Date.now();
 						try {
-							const result = await this.wsServer!.sendCommand('GET_FILE_INFO', {}, 3000);
+							if (!this.wsServer) {
+								throw new Error(this.desktopBridgeEnabled ? "WebSocket server is not running" : DESKTOP_BRIDGE_DISABLED_MESSAGE);
+							}
+							const result = await this.wsServer.sendCommand('GET_FILE_INFO', {}, 3000);
 							probeResult = {
 								success: !!(result && result.fileInfo),
 								latencyMs: Date.now() - probeStart,
@@ -1269,6 +1296,8 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 					// Recovery steps for agents to act on programmatically
 					const recoverySteps: string[] | undefined = setupValid
 						? undefined
+						: !this.desktopBridgeEnabled
+							? this.buildConnectionError(new Error(DESKTOP_BRIDGE_DISABLED_MESSAGE)).recoverySteps
 						: failureLayer === 1
 							? [
 								"Ensure your AI client (Claude Code, Cursor, etc.) is running with figma-console-mcp configured",
@@ -1307,6 +1336,8 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 													: undefined,
 											websocket: {
 												available: wsConnected,
+												// FIGMA_DESKTOP_BRIDGE=false: the server was started without the bridge on purpose
+												disabled: !this.desktopBridgeEnabled || undefined,
 												serverRunning: this.wsServer?.isStarted() ?? false,
 												// Version of the plugin files this server ships — what a
 												// manifest re-import installs. pluginUpdateAvailable on
@@ -1377,13 +1408,17 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 												? this.wsActualPort !== this.wsPreferredPort
 													? `✅ Connected to Figma Desktop via WebSocket Bridge (port ${this.wsActualPort}, fallback from ${this.wsPreferredPort})`
 													: "✅ Connected to Figma Desktop via WebSocket Bridge"
+												: !this.desktopBridgeEnabled
+													? `Desktop Bridge disabled (${DESKTOP_BRIDGE_ENV}=false) — REST API tools only`
 												: this.wsStartupError?.code === "EADDRINUSE"
 													? `❌ All WebSocket ports ${this.wsPreferredPort}-${this.wsPreferredPort + 9} are in use`
 													: this.wsActualPort !== null && this.wsActualPort !== this.wsPreferredPort
 													? `❌ WebSocket server running on port ${this.wsActualPort} (fallback) but no plugin connected. Restart the Desktop Bridge plugin in Figma to reconnect.`
 													: "❌ No connection to Figma Desktop",
 											setupInstructions: !setupValid
-												? this.wsStartupError?.code === "EADDRINUSE"
+												? !this.desktopBridgeEnabled
+													? { instructions: DESKTOP_BRIDGE_DISABLED_MESSAGE }
+												: this.wsStartupError?.code === "EADDRINUSE"
 													? {
 														cause: `All ports in range ${this.wsPreferredPort}-${this.wsPreferredPort + 9} are in use by other MCP server instances.`,
 														fix: "Close some of the other Claude Desktop tabs or terminal sessions running the MCP server, then restart this one.",
@@ -3234,6 +3269,7 @@ Without libraryFileKey/libraryFileUrl, searches the currently open file (local c
 				}
 			},
 			getBundledPluginVersion,
+			isDesktopBridgeDisabled: () => !this.desktopBridgeEnabled,
 			getPluginState: () => {
 				if (!this.wsServer) return null;
 				const fileInfo = this.wsServer.getConnectedFileInfo();
@@ -3850,6 +3886,223 @@ Without libraryFileKey/libraryFileUrl, searches the currently open file (local c
 	}
 
 	/**
+	 * Start the WebSocket Desktop Bridge: copy the plugin files, reap stale
+	 * instances, bind a port in the range and wire up the plugin events.
+	 * Skipped entirely when FIGMA_DESKTOP_BRIDGE=false.
+	 */
+	private async startDesktopBridge(): Promise<void> {
+		// Copy plugin files to stable directory (~/.figma-console-mcp/plugin/)
+		// so users have a permanent import path that survives npx cache changes.
+		try {
+			const thisFile = fileURLToPath(import.meta.url);
+			const packageRoot = dirname(dirname(thisFile));
+			const sourcePluginDir = resolve(packageRoot, "figma-desktop-bridge");
+			if (existsSync(sourcePluginDir)) {
+				this.stablePluginPath = setupStablePluginDir(sourcePluginDir);
+			}
+		} catch {
+			// Non-critical — stable dir is a convenience feature
+		}
+
+		// Start WebSocket bridge server with port range fallback.
+		// If the preferred port is taken (e.g., Claude Desktop Chat tab already bound it),
+		// try subsequent ports in the range (9223-9232) so multiple instances can coexist.
+		const wsHost = process.env.FIGMA_WS_HOST || 'localhost';
+		this.wsPreferredPort = parseInt(process.env.FIGMA_WS_PORT || String(DEFAULT_WS_PORT), 10);
+
+		// Clean up stale/orphaned MCP server instances before trying to bind.
+		// Step 1: Remove stale port files and terminate zombie processes that have port files
+		cleanupStalePortFiles();
+		// Step 2: Deep scan for orphaned processes holding ports WITHOUT port files
+		// (e.g., old instances from before port file tracking, or files already cleaned up)
+		cleanupOrphanedProcesses(this.wsPreferredPort);
+
+		const portsToTry = getPortRange(this.wsPreferredPort);
+		let boundPort: number | null = null;
+		// Distinguish "every port was in use" from "bind failed for another
+		// reason" — eviction must only fire for genuine port exhaustion, and
+		// figma_get_status must report the real error code.
+		let lastNonPortError: { code: string; message: string } | null = null;
+
+		for (const port of portsToTry) {
+			try {
+				this.wsServer = new FigmaWebSocketServer({ port, host: wsHost });
+				await this.wsServer.start();
+
+				// Get the actual bound port (should match, but verify)
+				const addr = this.wsServer.address();
+				boundPort = addr?.port ?? port;
+				this.wsActualPort = boundPort;
+
+				if (boundPort !== this.wsPreferredPort) {
+					logger.info(
+						{ preferredPort: this.wsPreferredPort, actualPort: boundPort },
+						"Preferred WebSocket port was in use, bound to fallback port",
+					);
+				} else {
+					logger.info({ wsPort: boundPort }, "WebSocket bridge server started");
+				}
+
+				// Advertise the port so the Figma plugin and other tools can discover us
+				advertisePort(boundPort, wsHost);
+				registerPortCleanup(boundPort);
+
+				// Start heartbeat — periodically refresh the port file to prove this server is active.
+				// Other instances use this to detect zombie processes on startup.
+				const heartbeatPort = boundPort;
+				this.wsHeartbeatTimer = setInterval(() => refreshPortAdvertisement(heartbeatPort), HEARTBEAT_INTERVAL_MS);
+				this.wsHeartbeatTimer.unref(); // Don't prevent process exit
+
+				break;
+			} catch (wsError) {
+				const errorMsg = wsError instanceof Error ? wsError.message : String(wsError);
+				const errorCode = wsError instanceof Error ? (wsError as any).code : undefined;
+
+				if (errorCode === "EADDRINUSE" || errorMsg.includes("EADDRINUSE")) {
+					logger.debug(
+						{ port, error: errorMsg },
+						"Port in use, trying next in range",
+					);
+					this.wsServer = null;
+					continue;
+				}
+
+				// Non-port-conflict error — don't try more ports
+				logger.warn(
+					{ error: errorMsg, port },
+					"Failed to start WebSocket bridge server",
+				);
+				lastNonPortError = {
+					code: errorCode || "UNKNOWN",
+					message: errorMsg,
+				};
+				this.wsServer = null;
+				break;
+			}
+		}
+
+		// Phase 3: If all ports exhausted, try evicting the oldest instance and
+		// retry ONCE. Only for genuine EADDRINUSE exhaustion — killing a healthy
+		// sibling can't fix an EACCES/EADDRNOTAVAIL bind failure.
+		if (!boundPort && !lastNonPortError && evictOldestInstance(this.wsPreferredPort)) {
+			for (const port of portsToTry) {
+				try {
+					this.wsServer = new FigmaWebSocketServer({ port, host: wsHost });
+					await this.wsServer.start();
+					const addr = this.wsServer.address();
+					boundPort = addr?.port ?? port;
+					this.wsActualPort = boundPort;
+					logger.info(
+						{ wsPort: boundPort, eviction: true },
+						"WebSocket bridge server started after evicting stale instance",
+					);
+					advertisePort(boundPort, wsHost);
+					registerPortCleanup(boundPort);
+					const heartbeatPort = boundPort;
+					this.wsHeartbeatTimer = setInterval(() => refreshPortAdvertisement(heartbeatPort), HEARTBEAT_INTERVAL_MS);
+					this.wsHeartbeatTimer.unref();
+					break;
+				} catch (wsError) {
+					const errorCode = wsError instanceof Error ? (wsError as any).code : undefined;
+					if (errorCode === "EADDRINUSE") {
+						this.wsServer = null;
+						continue;
+					}
+					this.wsServer = null;
+					break;
+				}
+			}
+		}
+
+		if (!boundPort) {
+			this.wsStartupError = {
+				code: lastNonPortError?.code ?? "EADDRINUSE",
+				port: this.wsPreferredPort,
+			};
+			const rangeEnd = this.wsPreferredPort + portsToTry.length - 1;
+			logger.warn(
+				lastNonPortError
+					? { error: lastNonPortError }
+					: { portRange: `${this.wsPreferredPort}-${rangeEnd}` },
+				lastNonPortError
+					? "WebSocket bridge failed to start (non-port error) — running without WebSocket transport"
+					: "All WebSocket ports in range are in use — running without WebSocket transport",
+			);
+		}
+
+		if (this.wsServer) {
+			// Log when plugin files connect/disconnect (with file identity)
+			this.wsServer.on("fileConnected", (data: { fileKey: string; fileName: string }) => {
+				logger.info({ fileKey: data.fileKey, fileName: data.fileName }, "Desktop Bridge plugin connected via WebSocket");
+			});
+
+			// Plugin disconnect leaves cached variables stale — when the plugin reconnects
+			// after a sleep/wake or network blip, the file may have edits we missed
+			// (no DOCUMENT_CHANGE event was delivered while we were disconnected).
+			// Invalidate the cache for the disconnected file so the next read is fresh.
+			this.wsServer.on("fileDisconnected", (data: { fileKey: string; fileName: string }) => {
+				logger.info({ fileKey: data.fileKey, fileName: data.fileName }, "Desktop Bridge plugin disconnected from WebSocket");
+				if (data.fileKey) {
+					this.variablesCache.delete(data.fileKey);
+					// design-system-tools.ts stores token data under a prefixed key
+					this.variablesCache.delete(`vars:${data.fileKey}`);
+					void import("./core/design-system-manifest.js").then(
+						({ DesignSystemManifestCache }) => {
+							DesignSystemManifestCache.getInstance().invalidate(data.fileKey);
+						},
+					).catch(() => {});
+				}
+			});
+
+			// Invalidate variable cache when document changes are reported.
+			// Figma's documentchange API doesn't expose a specific variable change type —
+			// variable operations manifest as node PROPERTY_CHANGE events, so we invalidate
+			// on any style or node change to be safe.
+			this.wsServer.on("documentChange", (data: any) => {
+				if (data.hasStyleChanges || data.hasNodeChanges) {
+					if (data.fileKey) {
+						// Per-file cache invalidation — only clear the affected file's cache.
+						// Also clear the design-system-tools token entry (prefixed key)
+						// and the component manifest, so searches see new components
+						// and the design-system kit sees edited variables.
+						this.variablesCache.delete(data.fileKey);
+						this.variablesCache.delete(`vars:${data.fileKey}`);
+						void import("./core/design-system-manifest.js").then(
+							({ DesignSystemManifestCache }) => {
+								DesignSystemManifestCache.getInstance().invalidate(data.fileKey);
+							},
+						).catch(() => {});
+						logger.debug(
+							{ fileKey: data.fileKey, changeCount: data.changeCount, hasStyleChanges: data.hasStyleChanges, hasNodeChanges: data.hasNodeChanges },
+							"Variable cache invalidated due to document changes"
+						);
+					} else {
+						// Unidentified file (event arrived before FILE_INFO handshake completed).
+						// We don't know which cache entry to invalidate; do nothing rather than
+						// blanket-clear other files' caches. FILE_INFO will arrive shortly and
+						// any subsequent document changes will route correctly.
+						logger.debug(
+							{ changeCount: data.changeCount },
+							"Document change received before file identification — cache untouched"
+						);
+					}
+				}
+			});
+		}
+
+		// Periodically reap orphaned/zombie servers for the whole run, not just
+		// at startup, so the port range stays clean over long sessions. Runs
+		// only when the WS bridge actually bound a port. Unref'd internally.
+		if (this.wsActualPort !== null && !this.wsReaperStop) {
+			this.wsReaperStop = startPeriodicReaper(this.wsPreferredPort);
+		}
+
+		// Check if Figma Desktop is accessible (non-blocking, just for logging)
+		logger.info("Checking Figma Desktop accessibility...");
+		await this.checkFigmaDesktop();
+	}
+
+	/**
 	 * Start the MCP server
 	 */
 	async start(): Promise<void> {
@@ -3859,215 +4112,14 @@ Without libraryFileKey/libraryFileUrl, searches the currently open file (local c
 				"Starting Figma Console MCP (Local Mode)",
 			);
 
-			// Copy plugin files to stable directory (~/.figma-console-mcp/plugin/)
-			// so users have a permanent import path that survives npx cache changes.
-			try {
-				const thisFile = fileURLToPath(import.meta.url);
-				const packageRoot = dirname(dirname(thisFile));
-				const sourcePluginDir = resolve(packageRoot, "figma-desktop-bridge");
-				if (existsSync(sourcePluginDir)) {
-					this.stablePluginPath = setupStablePluginDir(sourcePluginDir);
-				}
-			} catch {
-				// Non-critical — stable dir is a convenience feature
-			}
-
-			// Start WebSocket bridge server with port range fallback.
-			// If the preferred port is taken (e.g., Claude Desktop Chat tab already bound it),
-			// try subsequent ports in the range (9223-9232) so multiple instances can coexist.
-			const wsHost = process.env.FIGMA_WS_HOST || 'localhost';
-			this.wsPreferredPort = parseInt(process.env.FIGMA_WS_PORT || String(DEFAULT_WS_PORT), 10);
-
-			// Clean up stale/orphaned MCP server instances before trying to bind.
-			// Step 1: Remove stale port files and terminate zombie processes that have port files
-			cleanupStalePortFiles();
-			// Step 2: Deep scan for orphaned processes holding ports WITHOUT port files
-			// (e.g., old instances from before port file tracking, or files already cleaned up)
-			cleanupOrphanedProcesses(this.wsPreferredPort);
-
-			const portsToTry = getPortRange(this.wsPreferredPort);
-			let boundPort: number | null = null;
-			// Distinguish "every port was in use" from "bind failed for another
-			// reason" — eviction must only fire for genuine port exhaustion, and
-			// figma_get_status must report the real error code.
-			let lastNonPortError: { code: string; message: string } | null = null;
-
-			for (const port of portsToTry) {
-				try {
-					this.wsServer = new FigmaWebSocketServer({ port, host: wsHost });
-					await this.wsServer.start();
-
-					// Get the actual bound port (should match, but verify)
-					const addr = this.wsServer.address();
-					boundPort = addr?.port ?? port;
-					this.wsActualPort = boundPort;
-
-					if (boundPort !== this.wsPreferredPort) {
-						logger.info(
-							{ preferredPort: this.wsPreferredPort, actualPort: boundPort },
-							"Preferred WebSocket port was in use, bound to fallback port",
-						);
-					} else {
-						logger.info({ wsPort: boundPort }, "WebSocket bridge server started");
-					}
-
-					// Advertise the port so the Figma plugin and other tools can discover us
-					advertisePort(boundPort, wsHost);
-					registerPortCleanup(boundPort);
-
-					// Start heartbeat — periodically refresh the port file to prove this server is active.
-					// Other instances use this to detect zombie processes on startup.
-					const heartbeatPort = boundPort;
-					this.wsHeartbeatTimer = setInterval(() => refreshPortAdvertisement(heartbeatPort), HEARTBEAT_INTERVAL_MS);
-					this.wsHeartbeatTimer.unref(); // Don't prevent process exit
-
-					break;
-				} catch (wsError) {
-					const errorMsg = wsError instanceof Error ? wsError.message : String(wsError);
-					const errorCode = wsError instanceof Error ? (wsError as any).code : undefined;
-
-					if (errorCode === "EADDRINUSE" || errorMsg.includes("EADDRINUSE")) {
-						logger.debug(
-							{ port, error: errorMsg },
-							"Port in use, trying next in range",
-						);
-						this.wsServer = null;
-						continue;
-					}
-
-					// Non-port-conflict error — don't try more ports
-					logger.warn(
-						{ error: errorMsg, port },
-						"Failed to start WebSocket bridge server",
-					);
-					lastNonPortError = {
-						code: errorCode || "UNKNOWN",
-						message: errorMsg,
-					};
-					this.wsServer = null;
-					break;
-				}
-			}
-
-			// Phase 3: If all ports exhausted, try evicting the oldest instance and
-			// retry ONCE. Only for genuine EADDRINUSE exhaustion — killing a healthy
-			// sibling can't fix an EACCES/EADDRNOTAVAIL bind failure.
-			if (!boundPort && !lastNonPortError && evictOldestInstance(this.wsPreferredPort)) {
-				for (const port of portsToTry) {
-					try {
-						this.wsServer = new FigmaWebSocketServer({ port, host: wsHost });
-						await this.wsServer.start();
-						const addr = this.wsServer.address();
-						boundPort = addr?.port ?? port;
-						this.wsActualPort = boundPort;
-						logger.info(
-							{ wsPort: boundPort, eviction: true },
-							"WebSocket bridge server started after evicting stale instance",
-						);
-						advertisePort(boundPort, wsHost);
-						registerPortCleanup(boundPort);
-						const heartbeatPort = boundPort;
-						this.wsHeartbeatTimer = setInterval(() => refreshPortAdvertisement(heartbeatPort), HEARTBEAT_INTERVAL_MS);
-						this.wsHeartbeatTimer.unref();
-						break;
-					} catch (wsError) {
-						const errorCode = wsError instanceof Error ? (wsError as any).code : undefined;
-						if (errorCode === "EADDRINUSE") {
-							this.wsServer = null;
-							continue;
-						}
-						this.wsServer = null;
-						break;
-					}
-				}
-			}
-
-			if (!boundPort) {
-				this.wsStartupError = {
-					code: lastNonPortError?.code ?? "EADDRINUSE",
-					port: this.wsPreferredPort,
-				};
-				const rangeEnd = this.wsPreferredPort + portsToTry.length - 1;
-				logger.warn(
-					lastNonPortError
-						? { error: lastNonPortError }
-						: { portRange: `${this.wsPreferredPort}-${rangeEnd}` },
-					lastNonPortError
-						? "WebSocket bridge failed to start (non-port error) — running without WebSocket transport"
-						: "All WebSocket ports in range are in use — running without WebSocket transport",
+			this.desktopBridgeEnabled = isDesktopBridgeEnabled(process.env[DESKTOP_BRIDGE_ENV]);
+			if (this.desktopBridgeEnabled) {
+				await this.startDesktopBridge();
+			} else {
+				logger.info(
+					`Desktop Bridge disabled (${DESKTOP_BRIDGE_ENV}=false) — no WebSocket server; REST API tools only`,
 				);
 			}
-
-			if (this.wsServer) {
-				// Log when plugin files connect/disconnect (with file identity)
-				this.wsServer.on("fileConnected", (data: { fileKey: string; fileName: string }) => {
-					logger.info({ fileKey: data.fileKey, fileName: data.fileName }, "Desktop Bridge plugin connected via WebSocket");
-				});
-
-				// Plugin disconnect leaves cached variables stale — when the plugin reconnects
-				// after a sleep/wake or network blip, the file may have edits we missed
-				// (no DOCUMENT_CHANGE event was delivered while we were disconnected).
-				// Invalidate the cache for the disconnected file so the next read is fresh.
-				this.wsServer.on("fileDisconnected", (data: { fileKey: string; fileName: string }) => {
-					logger.info({ fileKey: data.fileKey, fileName: data.fileName }, "Desktop Bridge plugin disconnected from WebSocket");
-					if (data.fileKey) {
-						this.variablesCache.delete(data.fileKey);
-						// design-system-tools.ts stores token data under a prefixed key
-						this.variablesCache.delete(`vars:${data.fileKey}`);
-						void import("./core/design-system-manifest.js").then(
-							({ DesignSystemManifestCache }) => {
-								DesignSystemManifestCache.getInstance().invalidate(data.fileKey);
-							},
-						).catch(() => {});
-					}
-				});
-
-				// Invalidate variable cache when document changes are reported.
-				// Figma's documentchange API doesn't expose a specific variable change type —
-				// variable operations manifest as node PROPERTY_CHANGE events, so we invalidate
-				// on any style or node change to be safe.
-				this.wsServer.on("documentChange", (data: any) => {
-					if (data.hasStyleChanges || data.hasNodeChanges) {
-						if (data.fileKey) {
-							// Per-file cache invalidation — only clear the affected file's cache.
-							// Also clear the design-system-tools token entry (prefixed key)
-							// and the component manifest, so searches see new components
-							// and the design-system kit sees edited variables.
-							this.variablesCache.delete(data.fileKey);
-							this.variablesCache.delete(`vars:${data.fileKey}`);
-							void import("./core/design-system-manifest.js").then(
-								({ DesignSystemManifestCache }) => {
-									DesignSystemManifestCache.getInstance().invalidate(data.fileKey);
-								},
-							).catch(() => {});
-							logger.debug(
-								{ fileKey: data.fileKey, changeCount: data.changeCount, hasStyleChanges: data.hasStyleChanges, hasNodeChanges: data.hasNodeChanges },
-								"Variable cache invalidated due to document changes"
-							);
-						} else {
-							// Unidentified file (event arrived before FILE_INFO handshake completed).
-							// We don't know which cache entry to invalidate; do nothing rather than
-							// blanket-clear other files' caches. FILE_INFO will arrive shortly and
-							// any subsequent document changes will route correctly.
-							logger.debug(
-								{ changeCount: data.changeCount },
-								"Document change received before file identification — cache untouched"
-							);
-						}
-					}
-				});
-			}
-
-			// Periodically reap orphaned/zombie servers for the whole run, not just
-			// at startup, so the port range stays clean over long sessions. Runs
-			// only when the WS bridge actually bound a port. Unref'd internally.
-			if (this.wsActualPort !== null && !this.wsReaperStop) {
-				this.wsReaperStop = startPeriodicReaper(this.wsPreferredPort);
-			}
-
-			// Check if Figma Desktop is accessible (non-blocking, just for logging)
-			logger.info("Checking Figma Desktop accessibility...");
-			await this.checkFigmaDesktop();
 
 			// Register all tools
 			this.registerTools(this.server);

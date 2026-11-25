@@ -36,4 +36,11 @@ describe("figma_diagnose", () => {
 		expect(r).toContain("listening on port 9223");
 		expect(r).toContain("close and reopen it once");
 	});
+
+	it("local, bridge disabled: says so instead of asking for the plugin", async () => {
+		const r = await report({ mode: "local", getServerVersion: () => "1", isDesktopBridgeDisabled: () => true, getPluginState: () => null });
+		expect(r).toContain("Desktop Bridge disabled (FIGMA_DESKTOP_BRIDGE=false)");
+		expect(r).not.toContain("No WebSocket server (cloud mode");
+		expect(r).not.toContain("close and reopen it once");
+	});
 });

@@ -780,6 +780,7 @@ The **Figma Desktop Bridge** plugin is the recommended way to connect Figma to t
 **Environment variables:**
 - `FIGMA_WS_PORT` — Override the preferred WebSocket port (default: 9223). The server will fall back through a 10-port range starting from this value if the preferred port is occupied.
 - `FIGMA_WS_HOST` — Override the WebSocket server bind address (default: `localhost`). Set to `0.0.0.0` when running inside Docker so the host machine can reach the MCP server.
+- `FIGMA_DESKTOP_BRIDGE` — Set to `false` to run without Figma Desktop (CI, servers, containers). The server then opens no WebSocket port, doesn't touch other figma-console-mcp instances, and doesn't copy the plugin files. REST API tools keep working with `FIGMA_ACCESS_TOKEN`; tools that need the plugin return an error saying the bridge is disabled. Default: enabled.
 - `FIGMA_MCP_HTTP_PORT` — Also serve MCP over Streamable HTTP at `http://127.0.0.1:<port>/mcp`, so other local clients can share this server's Figma connection. Off by default. See [Sharing one server over HTTP](#sharing-one-server-over-http-optional).
 - `FIGMA_MCP_HTTP_TOKEN` — With `FIGMA_MCP_HTTP_PORT`, require `Authorization: Bearer <token>` on every HTTP request.
 
